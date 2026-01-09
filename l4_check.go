@@ -1,7 +1,6 @@
 package checkhandler
 
 import (
-	"io"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -26,55 +25,28 @@ func (CheckHandler) CaddyModule() caddy.ModuleInfo {
 
 // Handle 实现 layer4.NextHandler
 //
-// 行为说明：
-// 1. 不消费数据（只 Read 1 byte，立刻放弃）
-// 2. 能真实感知 FIN / EOF / RST
-// 3. IdleTimeout 会在有数据时自动刷新
-// 4. 仅在异常时 Close，避免 CLOSE-WAIT
+// 设计说明：
+// - 不读取 socket（绝不抢 proxy 的数据）
+// - 仅设置 ReadDeadline
+// - timeout 由 proxy 的 Read 触发
+// - proxy 返回后，确保 fd 被关闭，避免 CLOSE-WAIT
 func (h *CheckHandler) Handle(conn *layer4.Connection, next layer4.Handler) error {
 	rawConn := conn.Conn
 
-	// === 启动后台监控协程 ===
-	done := make(chan struct{})
+	// 设置 idle timeout（关键）
+	if h.IdleTimeout > 0 {
+		_ = rawConn.SetReadDeadline(
+			time.Now().Add(time.Duration(h.IdleTimeout)),
+		)
+	}
 
-	go func() {
-		defer close(done)
-
-		buf := make([]byte, 1)
-
-		for {
-			// 设置 / 刷新 idle timeout
-			if h.IdleTimeout > 0 {
-				_ = rawConn.SetReadDeadline(
-					time.Now().Add(time.Duration(h.IdleTimeout)),
-				)
-			}
-
-			n, err := rawConn.Read(buf)
-
-			if err != nil {
-				// EOF / FIN / timeout / RST
-				_ = rawConn.Close()
-				return
-			}
-
-			if n > 0 {
-				// 把字节“丢回去”
-				// 这里不转发、不缓存，proxy 会重新从 socket 读
-				continue
-			}
-		}
-	}()
-
-	// === 放行给后续 handler（通常是 proxy） ===
 	var err error
 	if next != nil {
 		err = next.Handle(conn)
 	}
 
-	// === proxy 结束，确保 fd 回收 ===
+	// proxy 结束后，兜底关闭 fd
 	_ = rawConn.Close()
-	<-done
 
 	return err
 }
