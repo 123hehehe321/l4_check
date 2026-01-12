@@ -14,19 +14,16 @@ func init() {
 
 // CheckHandler
 //
-// 生产级设计原则（修正版）：
-// 1. 不读取 socket（绝不干扰 proxy 数据流）
-// 2. 仅通过 ReadDeadline 控制连接生命周期
-// 3. 正常连接生命周期完全交给 proxy
-// 4. 仅在异常时兜底关闭，防止半死连接
-// 5. 不制造 FIN-WAIT-2 / CLOSE-WAIT
-// 6. 行为可预期、可长期运行
+// 职责说明：
+// 1. 在连接建立后尽早设置 TCP keepalive
+// 2. 不干预数据流、不设置 deadline
+// 3. 不参与连接关闭决策
+// 4. 仅在配置错误（没有下游 handler）时兜底关闭
+//
+// 这是一个“纯初始化型”的 Layer4 handler
 type CheckHandler struct {
-	// IdleTimeout 指连接在无任何读活动下允许存活的最大时间
-	IdleTimeout caddy.Duration `json:"idle_timeout,omitempty"`
-
-	// TCPKeepAlivePeriod 设置 TCP keepalive 探测周期
-	// 为 0 表示使用系统默认
+	// TCP keepalive 探测间隔
+	// 仅作用于 Client -> Caddy 这一段
 	TCPKeepAlivePeriod caddy.Duration `json:"tcp_keepalive_period,omitempty"`
 }
 
@@ -37,46 +34,31 @@ func (CheckHandler) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Handle 实现 layer4.NextHandler
-func (h *CheckHandler) Handle(conn *layer4.Connection, next layer4.Handler) (err error) {
-	rawConn := conn.Conn
+func (h *CheckHandler) Handle(conn *layer4.Connection, next layer4.Handler) error {
+	raw := conn.Conn
 
-	// === TCP keepalive（安全、不会影响 proxy） ===
-	if tc, ok := rawConn.(*net.TCPConn); ok {
+	// === TCP keepalive 初始化 ===
+	if tc, ok := raw.(*net.TCPConn); ok {
+		// 开启 keepalive
 		_ = tc.SetKeepAlive(true)
 
+		// 设置 keepalive 周期（如果配置了）
 		if h.TCPKeepAlivePeriod > 0 {
-			_ = tc.SetKeepAlivePeriod(
-				time.Duration(h.TCPKeepAlivePeriod),
-			)
+			_ = tc.SetKeepAlivePeriod(time.Duration(h.TCPKeepAlivePeriod))
 		}
 	}
 
-	// === Idle ReadDeadline（仅限制空闲，不主动 close） ===
-	if h.IdleTimeout > 0 {
-		_ = rawConn.SetReadDeadline(
-			time.Now().Add(time.Duration(h.IdleTimeout)),
-		)
-
-		// handler 退出时清理，避免影响后续 handler
-		defer rawConn.SetReadDeadline(time.Time{})
+	// === 配置错误保护 ===
+	// check handler 之后必须有下游（通常是 proxy）
+	if next == nil {
+		_ = raw.Close()
+		return nil
 	}
 
-	// === 交给下一个 handler（通常是 l4.proxy） ===
-	if next != nil {
-		err = next.Handle(conn)
-	}
-
-	// === 兜底策略：只在异常时关闭 ===
-	//
-	// 说明：
-	// - err == nil：大多数是正常 EOF / 正常 FIN
-	// - err != nil：copy 中断、deadline、对端异常
-	if err != nil {
-		_ = rawConn.Close()
-	}
-
-	return err
+	// === 完全交由下游 handler（proxy）处理 ===
+	// 不捕获、不包装、不额外 close
+	return next.Handle(conn)
 }
 
+// 编译期接口断言
 var _ layer4.NextHandler = (*CheckHandler)(nil)
